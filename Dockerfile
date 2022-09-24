@@ -39,6 +39,8 @@ RUN wget https://github.com/BenLangmead/bowtie2/releases/download/v2.4.5/bowtie2
     unzip bowtie2-2.4.5-linux-x86_64.zip &&\
     mv bowtie2-2.4.5-linux-x86_64 /bin
 
+RUN ln -s ./FastQC/fastqc /bin/
+
 ENV PATH="${PATH}:/bin/bowtie2-2.4.5-linux-x86_64"
 
 RUN python3 -m pip install --upgrade multiqc matplotlib numpy scipy lgenome cykhash macs3

@@ -1,45 +1,36 @@
 """latch/ATACseq"""
 
 import _io
-import csv
 import functools
 import os
-import re
 import shutil
 import subprocess
 import types
-from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import lgenome
 from dataclasses_json import dataclass_json
 from flytekit import task
-from flytekit.core.annotation import FlyteAnnotation
-from flytekit.core.launch_plan import reference_launch_plan
 from flytekitplugins.pod import Pod
 from kubernetes.client.models import (V1Container, V1PodSpec,
                                       V1ResourceRequirements, V1Toleration)
-from latch import (large_task, map_task, medium_task, message, small_task,
-                   workflow)
+from latch import (map_task, message, workflow)
 from latch.resources.launch_plan import LaunchPlan
-from latch.resources.tasks import cached_large_task
 from latch.types import LatchDir, LatchFile, file_glob
 
 print = functools.partial(print, flush=True)
 
-#
-# Base classes
-#
-    
+# Available latch genomes
 class LatchGenome(Enum):
     RefSeq_hg38_p14 = "Homo sapiens (RefSeq hg38.p14)"
     RefSeq_T2T_CHM13v2_0 = "Homo sapiens (RefSeq T2T-CHM13v2.0)"
     RefSeq_R64 = "Saccharomyces cerevisiae (RefSeq R64)"
     RefSeq_GRCm39 = "Mus musculus (RefSeq GRCm39)"
 
+# Handling of single vs paired-end reads
 @dataclass_json
 @dataclass
 class SingleEndReads:
@@ -59,7 +50,7 @@ class Strandedness(Enum):
     auto = "auto"
 
 Replicate = Union[SingleEndReads, PairedEndReads]
-    
+
 @dataclass_json
 @dataclass
 class Sample:
@@ -74,8 +65,8 @@ class ATACseqInput:
     replicates: List[Replicate]
     run_name: str
     base_remote_output_dir: str
-    latch_genome: str
-    custom_ref_genome: List[LatchFile]
+    genome_index: LatchDir
+    genome_size: int
     clip_r1: Optional[int] = None
     clip_r2: Optional[int] = None
     three_prime_clip_r1: Optional[int] = None
@@ -86,12 +77,14 @@ class ATACseqInput:
 class ATACseqOutput:
     sample_name: str
     trimgalore_reports: List[LatchFile]
+    fastqc_zip: List[LatchFile]
+    fastqc_html: List[LatchFile]
     bam_file: LatchFile
     bed_file: LatchFile
     bdg_file: LatchFile
 
 #
-# Task specific classes
+# Task specific exception classes
 #
 
 class TrimgaloreError(Exception):
@@ -117,17 +110,6 @@ LatchFile.__repr__ = types.MethodType(___repr__, LatchFile)
 
 def slugify(value: str) -> str:
     return value.lower().replace(" ", "_")
-
-def _unzip_if_needed(path: Path):
-    is_gzipped = str(path).endswith(".gz")
-
-    if is_gzipped:
-        # Gunzip by default deletes .gz file; no need to manually delete
-        subprocess.run(["gunzip", str(path)])
-        unzipped_path_string = str(path).removesuffix(".gz")
-        return Path(unzipped_path_string)
-
-    return path
 
 def _remote_output_dir(custom_output_dir: Optional[LatchDir]) -> str:
     if custom_output_dir is None:
@@ -157,7 +139,6 @@ def _get_96_spot_pod() -> Pod:
         ),
         primary_container_name="primary",
     )
-
 
 large_spot_task = task(task_config=_get_96_spot_pod(), retries=3)
 
@@ -207,7 +188,7 @@ def _concatenate_files(filepaths: Iterable[str], output_path: str) -> Path:
                 shutil.copyfileobj(f, output_file)
     return path
 
-@small_task
+@large_spot_task
 def prepare_inputs(
     samples: List[Sample],
     run_name: str,
@@ -220,14 +201,21 @@ def prepare_inputs(
     custom_ref_genome: Optional[LatchFile] = None,
 ) -> List[ATACseqInput]:
 
+    # Compute bowtie2 index
+    (genome_index, gsize) = build_bowtie2_index(
+        latch_genome,
+        custom_ref_genome
+    )
+
+    # Bundle parameters before sending to main process
     return [
         ATACseqInput(
             sample_name=sample.name,
             replicates=sample.replicates,
             run_name=run_name,
             base_remote_output_dir=_remote_output_dir(custom_output_dir),
-            latch_genome=latch_genome.name,
-            custom_ref_genome=[],# custom_ref_genome,
+            genome_index=LatchDir(str(genome_index)),
+            genome_size=gsize,
             clip_r1=clip_r1,
             clip_r2=clip_r2,
             three_prime_clip_r1=three_prime_clip_r1,
@@ -237,12 +225,12 @@ def prepare_inputs(
     ]
 
 def do_trimgalore(
-    ts_input: ATACseqInput,
+    input: ATACseqInput,
     replicate_index: int,
     reads: Replicate,
-) -> Tuple[List[LatchFile], Replicate]:
+) -> Tuple[Replicate, List[LatchFile], List[LatchFile], List[LatchFile]]:
     def _flag(name: str) -> List[str]:
-        value = getattr(ts_input, name)
+        value = getattr(input, name)
         return [f"--{name}", value] if value is not None else []
 
     flags = [*_flag("clip_r1"), *_flag("three_prime_clip_r1")]
@@ -251,13 +239,14 @@ def do_trimgalore(
         flags += ["--paired", *_flag("clip_r2"), *_flag("three_prime_clip_r2")]
         read_paths.append(reads.r2.local_path)
 
-    local_output = f"{slugify(ts_input.sample_name)}_replicate_{replicate_index}"
+    local_output = f"{slugify(input.sample_name)}_replicate_{replicate_index}"
 
     return_code, stdout = piped_run(
         [[
             "trim_galore",
             "--cores",
             str(8),
+            "--fastqc",
             "--dont_gzip",
             "--output_dir",
             f"./{local_output}",
@@ -266,13 +255,12 @@ def do_trimgalore(
         ]]
     )
 
-    # todo(rohankan): examine trimgalore for useful warnings and add them here
     if return_code != 0:
         stdout = stdout.rstrip()
         stdout = stdout[stdout.rindex("\n") + 1 :]
         assert reads.r1.remote_path is not None
         path_name = reads.r1.remote_path.split("/")[-1]
-        identifier = f"sample {ts_input.sample_name}, replicate {path_name}"
+        identifier = f"sample {input.sample_name}, replicate {path_name}"
         message(
             "error",
             {"title": f"Trimgalore error for {identifier}", "body": stdout},
@@ -280,9 +268,9 @@ def do_trimgalore(
         raise TrimgaloreError(stdout)
 
     def remote(middle: str) -> str:
-        base = f"{ts_input.base_remote_output_dir}{ts_input.run_name}"
-        tail = f"{ts_input.sample_name}/replicate_{replicate_index}/"
-        return f"latch:///{base}/Quality Control Data/Trimming {middle} (TrimGalore)/{tail}"
+        base = f"{input.base_remote_output_dir}{input.run_name}"
+        tail = f"{input.sample_name}/replicate_{replicate_index}/"
+        return f"latch:///{base}/Quality Control/Trimming {middle}/{tail}"
 
     reads_directory = remote("Reads")
     if isinstance(reads, SingleEndReads):
@@ -299,16 +287,61 @@ def do_trimgalore(
         os.remove(reads.r2.local_path)
 
     reports_directory = remote("Reports")
-    reports = file_glob("*trimming_report.txt", reports_directory)
+    reports = file_glob(f"{local_output}/*trimming_report.txt", reports_directory)
 
-    return reports, trimmed_replicate
+    fastqc_directory = remote("FastQC")
+    fastqc_html = file_glob(f"{local_output}/*.html", fastqc_directory)
+    fastqc_zip = file_glob(f"{local_output}/*.zip", fastqc_directory)
+
+    return trimmed_replicate, reports, fastqc_zip, fastqc_html
+
+def build_bowtie2_index(
+    latch_genome: LatchGenome,
+    custom_ref_genome: Optional[LatchFile],
+) -> (Path, int):
+    # 
+    # Build or fetch bowtie2 index
+    #
+
+    if custom_ref_genome is None:
+        # Fetch the genome if already in db
+        gm = lgenome.GenomeManager(latch_genome.name)
+        custom_ref_genome = gm.download_ref_genome()
+    else:
+        custom_ref_genome = custom_ref_genome.local_path()
+
+    gsize = sum(len(line.strip()) for line in open(custom_ref_genome)
+                if not line.startswith(">"))
+
+    # # Run bowtie2-build
+    local_index_dir = Path("bowtie2_index").resolve()
+    
+    print(f"Building bowtie2 index for {custom_ref_genome}")
+    Path(local_index_dir).mkdir(exist_ok=True)
+
+    try:
+        (exit_code, stdout) = piped_run([
+            ["bowtie2-build",
+            custom_ref_genome,
+            f"{local_index_dir}/ref",
+            "--threads",
+            "96"]
+        ])
+    except subprocess.CalledProcessError as e:
+        exit_code = 1
+        stdout = e
+
+    if exit_code != 0:
+        raise Bowtie2IndexError(stdout)
+
+    return (local_index_dir, gsize)
 
 @large_spot_task
 def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
     print(f"Processing {input.sample_name}")
     REMOTE_PATH = f"latch:///{input.base_remote_output_dir}{input.run_name}"
-    BAM_REMOTE_PATH = f"{REMOTE_PATH}/Alignments (Bowtie2)/{input.sample_name}/"
-    MACS3_REMOTE_PATH = f"{REMOTE_PATH}/Peak-calling (MACS3)/{input.sample_name}/"
+    BAM_REMOTE_PATH = f"{REMOTE_PATH}/Alignments (Bowtie2)/"
+    MACS3_REMOTE_PATH = f"{REMOTE_PATH}/Peak-calling (MACS3)/"
 
     #
     # Read trimming
@@ -320,8 +353,10 @@ def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
         print(f"\tTrimming error ~ {e}")
         return
 
-    trimgalore_reports = [y for x in outputs for y in x[0]]
-    trimmed_replicates = [x[1] for x in outputs]
+    trimmed_replicates = [x[0] for x in outputs]
+    trimgalore_reports = [y for x in outputs for y in x[1]]
+    fastqc_zip = [y for x in outputs for y in x[2]]
+    fastqc_html = [y for x in outputs for y in x[3]]
 
     #
     # Merge replicates before alignment
@@ -336,36 +371,6 @@ def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
         os.remove(rep.r1.path)
         if isinstance(rep, PairedEndReads):
             os.remove(rep.r2.path)
-
-    # 
-    # Build or fetch bowtie2 index
-    #
-    index_prefix = "bowtie2_index/ref"
-
-    if input.custom_ref_genome:
-        input.custom_ref_genome = input.custom_ref_genome[0].local_path()
-    else:
-        # Fetch the genome if already in db
-        gm = lgenome.GenomeManager(input.latch_genome)
-        input.custom_ref_genome = gm.download_ref_genome()
-        
-    # Run bowtie2-build
-    print(f"Build bowtie2 index for {input.custom_ref_genome}")
-    Path(index_prefix).parent.mkdir(exist_ok=True)
-    try:
-        (exit_code, stdout) = piped_run([
-            ["bowtie2-build",
-            input.custom_ref_genome,
-            index_prefix,
-            "--threads",
-            "96"]
-        ])
-    except subprocess.CalledProcessError as e:
-        exit_code = 1
-        stdout = e
-
-    if exit_code != 0:
-        raise Bowtie2IndexError(stdout)
     
     # 
     # Alignment with Bowtie2 piped with samtools to save space
@@ -373,11 +378,17 @@ def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
     bam_output = Path(f"bowtie2/{input.sample_name}.bam").resolve()
     bam_output.parent.mkdir(exist_ok=True)
 
+    # Flag: -F 1804: remove reads where
+    # - self or PE mate unmapped
+    # - not primary alignment
+    # - fails platform/vendor quality checks
+    # - PCR/optical duplicate
+    # Flag: -f 2: mapped in proper pair
     try:
         (exit_code, stdout) = piped_run([
             ["bowtie2",
              "--threads", "96",
-             "-x", index_prefix] + reads,
+             "-x", f"{input.genome_index.local_path}/ref"] + reads,
             ["samtools",
              "view", "-b", "-h",
              "-@", "96",
@@ -396,8 +407,6 @@ def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
     # 
     # Peak calling with MACS3
     #
-    genome_size = sum(len(x.strip()) for x in open(input.custom_ref_genome)
-                      if not x.startswith(">"))
     macs3_output = Path("MACS3").resolve()
     macs3_output.mkdir(exist_ok=True)
     
@@ -406,7 +415,7 @@ def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
             "macs3", "callpeak",
             "--treatment", bam_output,
             "--name", input.sample_name,
-            "--gsize", str(genome_size),
+            "--gsize", str(input.genome_size),
             "--bdg",
             "--qvalue", "0.01",
             "--outdir", "MACS3"
@@ -422,45 +431,12 @@ def trim_align_callpeak(input: ATACseqInput) -> Optional[ATACseqOutput]:
     return ATACseqOutput(
         sample_name=input.sample_name,
         trimgalore_reports=trimgalore_reports,
-        bam_file=LatchFile(bam_output, BAM_REMOTE_PATH + bam_output.name),
-        bed_file=LatchFile(peak_file, MACS3_REMOTE_PATH + peak_file.name),
-        bdg_file=LatchFile(peak_file, MACS3_REMOTE_PATH + bdg_file.name),
+        fastqc_html=fastqc_html,
+        fastqc_zip=fastqc_zip,
+        bam_file=LatchFile(str(bam_output), BAM_REMOTE_PATH + bam_output.name),
+        bed_file=LatchFile(str(peak_file), MACS3_REMOTE_PATH + peak_file.name),
+        bdg_file=LatchFile(str(bdg_file), MACS3_REMOTE_PATH + bdg_file.name),
     )
-
-# @large_spot_task
-# def get_bowtie2_index(
-#     run_name: str,
-#     output_dir: Optional[LatchDir],
-#     latch_genome: LatchGenome,
-#     custom_ref_genome: Optional[LatchFile],
-# ) -> LatchDir:
-#     # 
-#     # Build or fetch bowtie2 index
-#     #
-
-#     if custom_ref_genome is None:
-#         # Fetch the genome if already in db
-#         gm = lgenome.GenomeManager(latch_genome.name)
-#         custom_ref_genome = gm.download_ref_genome()
-#     else:
-#         custom_ref_genome = custom_ref_genome.local_path()
-
-#     # Run bowtie2-build
-#     local_index_dir = Path("bowtie2_index").resolve()
-#     prefix = "ref"
-    
-#     print(f"Build bowtie2 index for {custom_ref_genome}")
-#     subprocess.run([
-#         "bowtie2-build",
-#         custom_ref_genome,
-#         f"{local_index_dir}/{prefix}",
-#         "--threads",
-#         "96",
-#     ])
-
-#     REMOTE_PATH = f"latch:///{_remote_output_dir(output_dir)}{run_name}"
-
-#     return LatchDir(local_index_dir, REMOTE_PATH)
 
 # @small_task
 # def multiqc(
@@ -695,13 +671,6 @@ def atacseq(
           __metadata__:
             display_name: Custom Output Location
     """
-    # bowtie2_index = get_bowtie2_index(
-    #     run_name=run_name,
-    #     output_dir=custom_output_dir,
-    #     latch_genome=latch_genome,
-    #     custom_ref_genome=custom_ref_genome,
-    # )
-    
     inputs = prepare_inputs(
         samples=samples,
         run_name=run_name,
@@ -759,14 +728,14 @@ LaunchPlan(
                             "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep1_R2.fastq.gz",
                         )
                     ),
-                    # PairedEndReads(
-                    #     r1=LatchFile(
-                    #         "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep2_R1.fastq.gz",
-                    #     ),
-                    #     r2=LatchFile(
-                    #         "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep2_R2.fastq.gz",
-                    #     )
-                    # ),
+                    PairedEndReads(
+                        r1=LatchFile(
+                            "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep2_R1.fastq.gz",
+                        ),
+                        r2=LatchFile(
+                            "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep2_R2.fastq.gz",
+                        )
+                    ),
                 ],
             ),
         ],
@@ -778,20 +747,20 @@ LaunchPlan(
 if __name__ == '__main__':
     
     samples = [
-        Sample(
-            name="Control",
-            strandedness=Strandedness.auto,
-            replicates=[
-                PairedEndReads(
-                    r1=LatchFile(
-                        "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/WT_R1.fastq.gz",
-                    ),
-                    r2=LatchFile(
-                        "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/WT_R2.fastq.gz",
-                    )
-                ),
-            ],
-        ),
+        # Sample(
+        #     name="Control",
+        #     strandedness=Strandedness.auto,
+        #     replicates=[
+        #         PairedEndReads(
+        #             r1=LatchFile(
+        #                 "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/WT_R1.fastq.gz",
+        #             ),
+        #             r2=LatchFile(
+        #                 "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/WT_R2.fastq.gz",
+        #             )
+        #         ),
+        #     ],
+        # ),
         Sample(
             name="Arp8delta",
             strandedness=Strandedness.auto,
@@ -804,14 +773,6 @@ if __name__ == '__main__':
                         "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep1_R2.fastq.gz",
                     )
                 ),
-                # PairedEndReads(
-                #     r1=LatchFile(
-                #         "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep2_R1.fastq.gz",
-                #     ),
-                #     r2=LatchFile(
-                #         "s3://latch-public/test-data/7482/SCerevisae-wt-vs-arp8d/arp8delta_rep2_R2.fastq.gz",
-                #     )
-                # ),
             ],
         ),
     ]
@@ -819,7 +780,7 @@ if __name__ == '__main__':
     atacseq(samples=samples,
             ref_selection_fork="from_db",
             output_location_fork="default",
-            run_name="atacseq-test",
+            run_name="ATAC-seq-test",
             latch_genome=LatchGenome.RefSeq_R64,
             custom_ref_genome=None,
             custom_output_dir=None)
